@@ -1,16 +1,19 @@
 use std::{collections::HashMap, process::Stdio, sync::Arc};
 
 use clap::Parser;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{
+    SinkExt, StreamExt,
+    stream::{SplitSink, SplitStream},
+};
 use log::info;
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
     process::{ChildStdin, Command as TokioCommand},
-    sync::Mutex,
+    sync::{Mutex, mpsc::UnboundedReceiver},
 };
 use tokio_tungstenite::{
-    accept_hdr_async,
+    WebSocketStream, accept_hdr_async,
     tungstenite::{
         Message,
         handshake::server::{Request, Response},
@@ -26,7 +29,7 @@ struct Args {
     #[arg(
         short,
         long,
-        default_value = "127.0.0.1:8080",
+        default_value = "127.0.0.1:9000",
         help = "WebSocket address"
     )]
     ws_addr: String,
@@ -92,101 +95,109 @@ async fn main() {
         let authorization = args.authorization.clone();
 
         tokio::spawn(async move {
-            let role_from_query = Arc::new(Mutex::new(None)); // 초기값 없음
-            let role_capture = role_from_query.clone();
-
-            let callback = move |req: &Request, response: Response| {
-                // 인증
-                let token = req
-                    .headers()
-                    .get("Authorization")
-                    .and_then(|v| v.to_str().ok())
-                    .unwrap_or("authorization");
-
-                if token != authorization.as_str() {
-                    let response = Response::builder()
-                        .status(401)
-                        .body(Some("Unauthorized".into()))
-                        .unwrap();
-                    return Err(response);
-                }
-
-                // 쿼리에서 role 추출
-                if let Some(query) = req.uri().query() {
-                    for pair in query.split('&') {
-                        let mut kv = pair.splitn(2, '=');
-                        if let (Some(k), Some(v)) = (kv.next(), kv.next()) {
-                            if k == "role" {
-                                let mut lock = role_capture.blocking_lock(); // 동기 잠금 (콜백이 sync 함수이므로)
-                                *lock = Some(v.to_string());
-                            }
-                        }
-                    }
-                }
-
-                Ok(response)
-            };
-
-            match accept_hdr_async(stream, callback).await {
-                Ok(ws_stream) => {
-                    println!("Client connected!");
-                    // role_from_query를 클로저 밖에서 사용하려면 move로 복사
-                    let role = role_from_query
-                        .lock()
-                        .await
-                        .clone()
-                        .unwrap_or("user".to_string());
-                    if let Err(e) = handle_connection(ws_stream, clients, child_stdin, role).await {
-                        eprintln!("Connection error: {e:?}");
-                    }
-                }
-                Err(e) => {
-                    eprintln!("Connection rejected: {:?}", e);
-                }
+            if let Err(e) = handle_ws_connection(stream, authorization, clients, child_stdin).await
+            {
+                eprintln!("Connection error: {}", e);
             }
         });
     }
 }
 
+// Role 추출 함수 분리
+fn extract_role(req: &Request) -> String {
+    req.uri()
+        .query()
+        .and_then(|q| {
+            q.split('&')
+                .find(|pair| pair.starts_with("role="))
+                .and_then(|pair| pair.split('=').nth(1))
+        })
+        .unwrap_or("user")
+        .to_string()
+}
+
+// 인증 체크 함수 분리
+fn check_authorization(req: &Request, expected: &str) -> bool {
+    req.headers()
+        .get("Authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("authorization")
+        .eq(expected)
+}
+
+async fn handle_ws_connection(
+    stream: TcpStream,
+    authorization: String,
+    clients: Clients,
+    child_stdin: Arc<Mutex<ChildStdin>>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    // role을 저장할 String
+    let role = Arc::new(tokio::sync::Mutex::new(String::new()));
+    let role_clone = role.clone();
+
+    let callback = |req: &Request, response: Response| {
+        if !check_authorization(req, &authorization) {
+            return Err(Response::builder()
+                .status(401)
+                .body(Some("Unauthorized".to_string()))
+                .unwrap());
+        }
+        let extracted_role = extract_role(req);
+        // Use std::sync::Mutex instead for synchronous access
+        if let Ok(mut role) = role_clone.try_lock() {
+            *role = extracted_role;
+        }
+        Ok(response)
+    };
+
+    let ws_stream = accept_hdr_async(stream, callback).await?;
+    let extracted_role = role.lock().await.clone();
+    info!("Client connected with role: {}", extracted_role);
+    handle_connection(ws_stream, clients, child_stdin, extracted_role).await
+}
+
+// handle_connection 함수 분리
+async fn handle_stdin_messages(
+    mut read: SplitStream<WebSocketStream<TcpStream>>,
+    child_stdin: Arc<Mutex<ChildStdin>>,
+) {
+    while let Some(Ok(msg)) = read.next().await {
+        if let Message::Text(text) = msg {
+            let mut stdin = child_stdin.lock().await;
+            if let Err(e) = stdin.write_all(format!("{text}\n").as_bytes()).await {
+                eprintln!("Failed to write to stdin: {e:?}");
+            }
+        }
+    }
+}
+
+async fn handle_stdout_messages(
+    mut write: SplitSink<WebSocketStream<TcpStream>, Message>,
+    mut rx: UnboundedReceiver<Message>,
+) {
+    while let Some(msg) = rx.recv().await {
+        if write.send(msg).await.is_err() {
+            break;
+        }
+    }
+}
+
 async fn handle_connection(
-    ws_stream: tokio_tungstenite::WebSocketStream<TcpStream>,
+    ws_stream: WebSocketStream<TcpStream>,
     clients: Clients,
     child_stdin: Arc<Mutex<ChildStdin>>,
     role: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (mut write, mut read) = ws_stream.split();
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<Message>();
+    let (write, read) = ws_stream.split();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
     let id = Uuid::new_v4().to_string();
 
-    // role과 함께 저장
-    clients.lock().await.insert(id.clone(), (role.clone(), tx));
+    clients.lock().await.insert(id.clone(), (role, tx));
 
-    // 클라이언트 -> child stdin
-    let stdin_writer = {
-        let child_stdin = child_stdin.clone();
-        tokio::spawn(async move {
-            while let Some(Ok(msg)) = read.next().await {
-                if let Message::Text(text) = msg {
-                    let mut stdin = child_stdin.lock().await;
-                    if let Err(e) = stdin.write_all(format!("{text}\n").as_bytes()).await {
-                        eprintln!("Failed to write to stdin: {e:?}");
-                    }
-                }
-            }
-        })
-    };
-
-    // child stdout -> 해당 클라이언트
-    let stdout_reader = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if write.send(msg).await.is_err() {
-                break;
-            }
-        }
-    });
+    let stdin_writer = tokio::spawn(handle_stdin_messages(read, child_stdin));
+    let stdout_reader = tokio::spawn(handle_stdout_messages(write, rx));
 
     let _ = tokio::try_join!(stdin_writer, stdout_reader);
-
     clients.lock().await.remove(&id);
     Ok(())
 }
