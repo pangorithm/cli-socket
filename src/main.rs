@@ -27,7 +27,7 @@ type Clients = Arc<Mutex<HashMap<String, (String, tokio::sync::mpsc::UnboundedSe
 #[command(author, version, about)]
 struct Args {
     #[arg(
-        short,
+        short = 'w',
         long,
         default_value = "127.0.0.1:9000",
         help = "WebSocket address"
@@ -41,7 +41,7 @@ struct Args {
     )]
     child_process: String,
     #[arg(
-        short,
+        short = 'd',
         long,
         default_value = ".",
         help = "Working directory for child process"
@@ -61,6 +61,13 @@ struct Args {
         help = "print log level (trace, debug, info, warn, error)"
     )]
     log_level: String,
+    #[arg(
+        short = 'f',
+        long,
+        default_value = "./cli_socket.log",
+        help = "print log file (default: /var/log/cli_socket.log, must be writable by the user running this process)"
+    )]
+    log_file: String,
 }
 
 #[tokio::main]
@@ -75,6 +82,11 @@ async fn main() {
         "error" => log::LevelFilter::Error,
         _ => log::LevelFilter::Info, // 기본값
     };
+    let log_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&args.log_file)
+        .expect("Failed to open log file");
     env_logger::Builder::new()
         .filter_module("cli_socket", log_level)
         .format(|buf, record| {
@@ -87,6 +99,7 @@ async fn main() {
                 record.args()
             )
         })
+        .target(env_logger::Target::Pipe(Box::new(log_file)))
         .init();
     let ws_addr = args.ws_addr.clone();
 
