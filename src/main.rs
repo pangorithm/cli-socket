@@ -39,7 +39,14 @@ struct Args {
         default_value = "bash",
         help = "Path to the child process"
     )]
-    child_path: String,
+    child_process: String,
+    #[arg(
+        short,
+        long,
+        default_value = ".",
+        help = "Working directory for child process"
+    )]
+    work_dir: String,
     #[arg(
         short,
         long,
@@ -83,7 +90,14 @@ async fn main() {
         .init();
     let ws_addr = args.ws_addr.clone();
 
-    let mut child = TokioCommand::new(&args.child_path)
+    if let Ok(current_dir) = std::env::current_dir() {
+        info!("Working directory: {}", current_dir.display());
+        info!("Working directory for child process: {}", &args.work_dir);
+    } else {
+        error!("Failed to get current working directory");
+    }
+    let mut child = TokioCommand::new(&args.child_process)
+        .current_dir(&args.work_dir)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()
