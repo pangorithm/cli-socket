@@ -5,7 +5,7 @@ use futures_util::{
     SinkExt, StreamExt,
     stream::{SplitSink, SplitStream},
 };
-use log::info;
+use log::{error, info, trace};
 use tokio::{
     io::{AsyncBufReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -47,12 +47,40 @@ struct Args {
         help = "authorization header"
     )]
     authorization: String,
+    #[arg(
+        short,
+        long,
+        default_value = "info",
+        help = "print log level (trace, debug, info, warn, error)"
+    )]
+    log_level: String,
 }
 
 #[tokio::main]
 async fn main() {
-    let _ = env_logger::try_init();
     let args = Args::parse();
+
+    let log_level = match args.log_level.to_lowercase().as_str() {
+        "trace" => log::LevelFilter::Trace,
+        "debug" => log::LevelFilter::Debug,
+        "info" => log::LevelFilter::Info,
+        "warn" => log::LevelFilter::Warn,
+        "error" => log::LevelFilter::Error,
+        _ => log::LevelFilter::Info, // 기본값
+    };
+    env_logger::Builder::new()
+        .filter_module("cli_socket", log_level)
+        .format(|buf, record| {
+            use std::io::Write;
+            writeln!(
+                buf,
+                "[{} {}] {}",
+                chrono::Local::now().format("%Y-%m-%d %H:%M:%S"),
+                record.level(),
+                record.args()
+            )
+        })
+        .init();
     let ws_addr = args.ws_addr.clone();
 
     let mut child = TokioCommand::new(&args.child_path)
@@ -72,12 +100,13 @@ async fn main() {
         let mut reader = tokio::io::BufReader::new(child_stdout).lines();
         while let Ok(Some(line)) = reader.next_line().await {
             let msg = Message::Text(line.into());
+            trace!("stdout: {}", &msg);
             let clients = clients_clone.lock().await;
             for (id, (role, tx)) in clients.iter() {
                 if role == "listen" {
                     // role이 "listen"인 클라이언트에게만 메시지 전송
                     if tx.send(msg.clone()).is_err() {
-                        eprintln!("Failed to send to listener {id}");
+                        error!("Failed to send to listener {id}");
                     }
                 }
             }
@@ -97,7 +126,7 @@ async fn main() {
         tokio::spawn(async move {
             if let Err(e) = handle_ws_connection(stream, authorization, clients, child_stdin).await
             {
-                eprintln!("Connection error: {}", e);
+                error!("Connection error: {}", e);
             }
         });
     }
@@ -164,8 +193,9 @@ async fn handle_stdin_messages(
     while let Some(Ok(msg)) = read.next().await {
         if let Message::Text(text) = msg {
             let mut stdin = child_stdin.lock().await;
+            trace!("stdin: {}", &text);
             if let Err(e) = stdin.write_all(format!("{text}\n").as_bytes()).await {
-                eprintln!("Failed to write to stdin: {e:?}");
+                error!("Failed to write to stdin: {e:?}");
             }
         }
     }
