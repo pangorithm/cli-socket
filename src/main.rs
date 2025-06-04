@@ -1,4 +1,4 @@
-use std::{collections::HashMap, process::Stdio, sync::Arc};
+use std::{collections::HashMap, env, process::Stdio, sync::Arc};
 
 use clap::Parser;
 use futures_util::{
@@ -50,10 +50,10 @@ struct Args {
     #[arg(
         short,
         long,
-        default_value = "authorization",
-        help = "authorization header"
+        default_value = "false",
+        help = "use authorization header"
     )]
-    authorization: String,
+    authorization: bool,
     #[arg(
         short,
         long,
@@ -73,6 +73,7 @@ struct Args {
 #[tokio::main]
 async fn main() {
     let args = Args::parse();
+    println!("process start with {:?}", args);
 
     let log_level = match args.log_level.to_lowercase().as_str() {
         "trace" => log::LevelFilter::Trace,
@@ -148,10 +149,16 @@ async fn main() {
         let (stream, _) = listener.accept().await.expect("Failed to accept");
         let clients = clients.clone();
         let child_stdin = child_stdin.clone();
-        let authorization = args.authorization.clone();
 
         tokio::spawn(async move {
-            if let Err(e) = handle_ws_connection(stream, authorization, clients, child_stdin).await
+            if let Err(e) = handle_ws_connection(
+                stream,
+                args.authorization,
+                env::var("AUTHORIZATION").unwrap_or_else(|_| "authorization".to_string()),
+                clients,
+                child_stdin,
+            )
+            .await
             {
                 error!("Connection error: {}", e);
             }
@@ -168,21 +175,25 @@ fn extract_role(req: &Request) -> String {
                 .find(|pair| pair.starts_with("role="))
                 .and_then(|pair| pair.split('=').nth(1))
         })
-        .unwrap_or("user")
+        .unwrap_or("default")
         .to_string()
 }
 
 // 인증 체크 함수 분리
-fn check_authorization(req: &Request, expected: &str) -> bool {
-    req.headers()
-        .get("Authorization")
-        .and_then(|v| v.to_str().ok())
-        .unwrap_or("authorization")
-        .eq(expected)
+fn check_authorization(req: &Request, use_authorization: bool, expected: &str) -> bool {
+    if use_authorization {
+        req.headers()
+            .get("Authorization")
+            .and_then(|v| v.to_str().ok())
+            .map_or(false, |val| val == expected)
+    } else {
+        true
+    }
 }
 
 async fn handle_ws_connection(
     stream: TcpStream,
+    use_authorization: bool,
     authorization: String,
     clients: Clients,
     child_stdin: Arc<Mutex<ChildStdin>>,
@@ -192,7 +203,7 @@ async fn handle_ws_connection(
     let role_clone = role.clone();
 
     let callback = |req: &Request, response: Response| {
-        if !check_authorization(req, &authorization) {
+        if !check_authorization(req, use_authorization, &authorization) {
             return Err(Response::builder()
                 .status(401)
                 .body(Some("Unauthorized".to_string()))
